@@ -1,0 +1,256 @@
+---
+title: "Predicting School GCSE grades"
+author: "Sophie Bennett"
+date: "31 March 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE)
+
+```
+
+```{r libs, include = FALSE}
+
+library(tidyverse)
+library(olsrr)
+library(rvest)
+library(flextable)
+extrafont::loadfonts(device = "win")
+
+```
+Every year, the UK government releases a comprehensive dataset showing average GCSE grades at each school alongside demographic information about the schools. You can download the data yourself [here.](https://www.compare-school-performance.service.gov.uk/download-data)
+
+For obvious anonymity reasons, the government don't provide the grades of individual students. Nonetheless, it's a fascinating dataset that can be used to look at the relationship between different demographic variables and educational achievement, as well as to track changes in GCSE results overtime.
+
+When the 2018-19 GCSE data became available in a couple of months ago, I'd been planning to take a look at the data primarily to explore how things like school size, school type and economic background of the students affect GCSE grades. 
+
+Although I'm still going to be doing that here, with the rise of the COVID-19 pandemic, and resulting school closures, the dataset has now become interesting for other reasons; schools in the UK are now shut and the government recently announced that GCSE and A-level exams have been cancelled. Instead, [grades will be awarded by Ofqual](https://www.gov.uk/government/publications/coronavirus-covid-19-cancellation-of-gcses-as-and-a-levels-in-2020/coronavirus-covid-19-cancellation-of-gcses-as-and-a-levels-in-2020) using a combination of teacher assessment, prior grades and other school data. Ofqual haven't yet explained exactly how this will work.
+
+Understandably, this has generated a fair bit of concern from students, parents and teachers. I suspect that students, on the whole, will have been hoping for grades to be awarded on the basis of teacher predicted grades, and may be suspicious of any algorithms or processes that Ofqual might use. 
+
+But on the flip side, the government/Ofqual really do have quite a large amount of data about both individual students, and their schools across many years of study. This makes me wonder how accurately the government *could*  predict the grades of individual students, if it were entirely in their hands?
+
+Obviously, with only aggregated data at the school level, I can't answer *that* question, but the dataset does at least enable me to answer a proxy question - how well could the government predict the average grades for individual schools?
+
+***
+## GCSE 2018-2019 Data
+
+There are two "core" GCSE measures: average attainment 8 score, and average progress 8 score.
+
+Attainment 8 measures the achievement of students across 8 qualifications, assigning double weighting to Maths and English. The other qualifications must be on the Department for Education's approved list. If a student doesn't have 8 qualifications from the approved list, they are given a score of 0 for each absent qualification. This proves to be a problem when we look at average attainment 8 for Independent schools, since many of these schools are not yet following the new GCSE system - meaning that students in these schools wind up with inaccurately low attainment 8 scores.
+
+Progress 8 is a measure of how well a student has progressed relative to other pupils nationally who have achieved similar *prior* attainment. The measure basically compares the student's progress 8 to the average score obtained by students in their prior attainment group. Details of how it is calculated can be found on the Dept for Education's [website](https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/561021/Progress_8_and_Attainment_8_how_measures_are_calculated.pdf). Progress 8 can be a bit of a tricky measure to interpret for a number of reasons, particularly at the school-aggregated level, because it is sensitive to outliers. Irritatingly, progress 8 scores are also not shared for Independent schools.
+
+In my analysis, I will be focussing on **attainment 8** scores for now, which I consider somewhat easier to interpret. I will also be excluding independent schools from the analysis, since their attainment 8 scores cannot be compared properly to those of state schools.
+
+Excluding these schools, I end up with a data set including grammar schools, state schools, and special schools:
+
+```{r data, echo = FALSE}
+
+gcses <- read_csv("data/gcses-cleaned.csv") %>% 
+  mutate(gender = factor(gender, levels = c("Mixed", "Boys", "Girls"), ordered = TRUE))
+
+gcses %>% 
+  select(school, school_type, gender, num_pupils, att8_17, perc_fsm:att8) %>% 
+  head(10) %>% 
+  regulartable() %>% 
+  autofit()
+
+```
+
+Alongside the school name, we have the following variables:
+
+* school_type: whether the school is a state school, grammar school, or special school
+* gender: whether the school is mixed, girls-only, or boys-only
+* att8_17: the school's average attainment 8 score in 2017-2018
+* perc_fsm: the percentage of FSM students in the school
+* perc_sec_lang: the percentage of English as a second language (EAL) students
+* perc_sen: the percentage of special needs students in the school
+* att8: the school's average attainment 8 score in 2018-2019
+
+(There are many other accompanying variables in the full dataset, although I have captured the main demographics available here. The code used to clean and extract these variables can be found on my "GCSEs" github project).
+
+***
+## Distrubution of Scores
+
+The distribution of school average attainment 8 scores is as follows:
+
+```{r distribution plots, fig.align = "center", echo = FALSE}
+
+gcses %>% 
+  ggplot() +
+  geom_density(aes(att8, fill = school_type, colour = school_type), alpha = 0.5, size = 1.2) +
+  theme_minimal() +
+  scale_colour_manual(values = c("#EF6351", "#F9BD56", "#A2CD5D")) +
+  scale_fill_manual(values = c("#f6a79d", "#fcdda6", "#d3e8b0")) +
+  labs(x = "Attainment 8 Score",
+       y = "Density",
+       fill = "",
+       colour = "") +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial Nova"),
+        panel.grid.minor = element_blank())
+
+```
+
+We can see that for state schools, the data is roughly normally distributed, with slight negative skew. 
+
+Unsurprisingly, grammar schools generally have higher attainment 8 scores than state schools. There's a funny bimodal peak to the distribution - which I would interpret cautiously given that there are only 163 grammar schools (compared with ~3000 state schools).
+
+Special schools have much lower attainment 8 scores, and the data is positively skewed. It's worth noting that students in special schools may not always do the same qualifications which is likely to make the scores hard to interpret. As a result, I'll be exlcuding special schools from further analysis.
+
+***
+## Relationship with Demographic Variables
+
+The plots below show how attainment 8 varies depending on each of our other demographic variables.
+
+```{r correlations, fig.align = "center", out.width = "120%", echo = FALSE}
+
+gcses %>% 
+  filter(school_type != "Special School") %>% 
+  ggplot() +
+  geom_boxplot(aes(gender, att8, fill = gender), alpha = 0.8) +
+  facet_wrap(~school_type) +
+  labs(x = "",
+       y = "Att 8 Score",
+       fill = "") +
+  theme_minimal() +
+  theme(text = element_text(family = "Arial Nova"),
+        legend.position = "bottom") +
+  scale_fill_manual(values = c("#6BC499", "#308CA8", "#D35254"))
+
+gcses %>% 
+  filter(school_type != "Special School") %>% 
+  ggplot() + 
+  geom_point(aes(num_pupils, att8, colour = school_type), alpha = 0.4) +
+  labs(x = "Number of Pupils",
+       y = "Att 8 Score",
+       colour = "School Type") +
+  theme_minimal() +
+  theme(text = element_text(family = "Arial Nova"),
+        legend.position = "bottom") +
+  scale_colour_manual(values = c("#EF6351", "#A2CD5D"))
+
+gcses %>% 
+  filter(school_type != "Special School") %>% 
+  ggplot() +
+  geom_point(aes(att8_17, att8, colour = school_type), alpha = 0.5) +
+  labs(x = "2017-2018 Attainment 8",
+       y = "2018-2019 Attainment 8",
+       colour = "School Type") +
+  theme_minimal() +
+  theme(text = element_text(family = "Arial Nova"),
+        legend.position = "bottom") +
+  scale_colour_manual(values = c("#EF6351", "#A2CD5D"))
+
+
+gcses %>% 
+  filter(school_type != "Special School") %>% 
+  ggplot() +
+  geom_point(aes(perc_fsm, att8, colour = school_type), alpha = 0.4, size = 1.5) +
+  labs(x = "% FSM",
+       y = "Att 8 Score",
+       colour = "School Type") +
+  theme_minimal() +
+  theme(text = element_text(family = "Arial Nova")) +
+  scale_colour_manual(values = c("#EF6351", "#A2CD5D"))
+
+gcses %>% 
+  filter(school_type != "Special School") %>% 
+  ggplot() +
+  geom_point(aes(perc_sec_lang, att8, colour = school_type), alpha = 0.4) +
+  labs(x = "% EAL",
+       y = "Att 8 Score",
+       colour = "School Type") +
+  theme_minimal() +
+  theme(text = element_text(family = "Arial Nova"),
+        legend.position = "bottom") +
+  scale_colour_manual(values = c("#EF6351", "#A2CD5D"))
+
+gcses %>% 
+  filter(school_type != "Special School") %>%
+  filter(perc_sen != 100) %>% 
+  ggplot() + 
+  geom_point(aes(perc_sen, att8, colour = school_type), alpha = 0.4) +
+  labs(x = "% SEN",
+       y = "Att 8 Score",
+       colour = "School Type") +
+  theme_minimal() +
+  theme(text = element_text(family = "Arial Nova"),
+        legend.position = "bottom") +
+  scale_colour_manual(values = c("#EF6351", "#A2CD5D"))
+
+```
+
+The relationships vary in magnitude, but it looks like all of these variables share some relationship with attainment 8 scores. Notably, this is very much more true for **state** schools than grammar schools. 
+
+Some variables, such as pupil number and percentage EAL students share small correlations with attainment 8 scores. The percentage of SEN students also shares a negative correlations with attainment 8 scores.
+
+The variable most correlated with attainment 8 is clearly the school's 2017-2018 attainment 8 score. This is particularly interesting given that the government has implied that they may use the prior grades of schools to moderate student grades assigned to students this year.
+
+The percentage of FSM students also share a substantial correlation with attainment 8. Not that surprising given the established relationship between income level and educational achievement.
+
+Finally, there's a clear effect of gender, whereby mixed schools tend to do less well, and girls-only schools tend to do best.
+
+***
+# Regression Modelling
+
+To model the effects of each variable on attainment 8, I've opted to use multiple linear regression. (I did also play around with quantile regression on this dataset, which I may blog about in a separate post...). It's probably not the technique that yields the best prediction accuracy, but I want an interpretable model. I think opting for something  interpretable is more realistic too - the goal of predicting student grades to replace actual exam grades is so high stakes that I suspect if the government were to do this, they'd want a model they could understand!
+
+The plots above indicate that many of the variables I'm adding into the model have a substantially larger effect on state schools than grammar schools. I could model this with an interaction term, but since the total number of grammar schools is small I've instead opted to focus just on state schools.
+
+This is the model summary:
+
+```{r regression, echo = FALSE}
+
+gcses_state <- gcses %>% 
+  filter(school_type == "State School")
+
+model <- lm(att8 ~ att8_17 + perc_fsm + gender + perc_sec_lang + perc_sen, data = gcses_state)
+
+sjPlot::tab_model(model)
+
+```
+
+
+And here are the diagnostic plots:
+
+```{r regression plots, out.width = "60%", fig.align = "center", echo = FALSE}
+
+qq_plot <- ols_plot_resid_qq(model)
+
+resid_plot <- ols_plot_resid_fit(model)
+
+dev_plot <- ols_plot_obs_fit(model)
+
+hist_plot <- ols_plot_resid_hist(model)
+
+gridExtra::grid.arrange(qq_plot, resid_plot, dev_plot, hist_plot, nrow = 2)
+
+```
+
+So what can we tell from this? Well, for a start, *all* of our variables are significant predictors. As it stands, the model accounts for ~ 84% of the variance in school attainment 8 scores. This is pretty good, although far from perfect. The school's prior grades appear to be one of the strongest predictors of the 2018-2019 grades. (It may be an even stronger predictor had I included data from years before 2017-2018 too). The gender distribution in the school is also an important predictor, with all-girls schools achieving significantly better grades than mixed and all-boys schools.
+
+
+The diagnostics are also interesting: the assumptions of linearity and normality hold up pretty well, although there is some deviance in residuals in the bottom quantile. The plot of actual versus fitted values is also enlightening - from this we can see that the model does least well at predicting the values for schools with *lower* attainment 8 scores, and tends to underestimate values for these schools.
+
+***
+## Conclusions
+
+The model fit achieved even with this simple model suggests that student grades could be predicted reasonably well from existing data. I suspect that with access to individual level data, the government could achieve an even better fit. 
+
+That being said, there are still some big problems:
+
+* Since students won't be taking exams this year, we'd never know how accurate the predictions really were
+* The model wouldn't be accurate for all students. 
+
+The biggest issue with inaccuracy lies in the fact that the model becomes *less* accurate for schools with lower attainment 8 scores, which are often the schools with the most economically disadvantaged students. Since the model underestimates grades in these schools, it looks like students at these schools might be the most disadvanted by a solution that relied on prediction based on prior data. This is likely to be compounded by the fact that these schools tend to display more variability in grades both within and across cohorts. Hoepfully this is something that Ofqual will take into consideration.
+
+Nonetheless, given that Ofqual *are* likely to use a school's prior grades to moderate student grades this year, it's interesting to see that it can be a pretty strong predictor of grades (at least at the aggregate level). I'd be keen to find out how they're planning to use this information.
+
+Fundamentally, there's no perfect solution to this problem. I think using both school and individual student data alongside teacher predictions is a sensible solution, even if some students are likely to be unhappy. (In light of this, it's great that students will be given the option to take an exam later in the year if they're not happy with their assigned grade).
+
+Without getting all students to take an exam later next year, we'll never find out how accurate the process that Ofqual settles on really ends up being... I suspect that even if Ofqual were able to assign grades that perfectly predicted those he grades students *would have obtained* in their GCSE exam, we'd still see unhappy students, teachers and parents. 
+
+Finally, it's worth pointing out that assessing a student's ability is an incredibly difficult task, and end of year exams aren't a perfect predictor of a student's abilities in the first place. 
